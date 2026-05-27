@@ -1,0 +1,450 @@
+name: Policy for creation of repository
+
+on:
+  workflow_dispatch:
+    inputs:
+      projeto:
+        description: "Nome do projeto"
+        required: true
+        type: string
+
+      visibility:
+        description: "Visibilidade do repositório"
+        required: true
+        default: "private"
+        type: choice
+        options:
+          - private
+          - public
+
+      descricao:
+        description: "Descrição do repositório"
+        required: false
+        type: string
+        
+permissions: {}
+
+jobs:
+  create-repository:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: AgSUS-COGIP
+          
+      - name: Normalize names
+        id: normalize
+        run: |
+          PROJETO=$(echo "${{ github.event.inputs.projeto }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/ /-/g' \
+            | sed 's/[^a-z0-9-]//g')
+
+          REPO_NAME="COGIP_${PROJETO}"
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+
+      - name: Validate repository name and existence
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG_NAME: AgSUS-COGIP
+        run: |
+          REPO_NAME="${{ steps.normalize.outputs.repo_name }}"
+          REGEX="^COGIP_[a-z0-9-]+$"
+
+          # 1. Validação de Formato (Regex)
+          if [[ ! "$REPO_NAME" =~ $REGEX ]]; then
+            echo "Erro: Nome inválido no padrão Regex: $REPO_NAME"
+            exit 1
+          fi
+
+          # 2. Validação de Existência (Se o comando 'gh repo view' der certo, significa que o repo JÁ EXISTE)
+          echo "Verificando disponibilidade do nome..."
+          if gh repo view "$ORG_NAME/$REPO_NAME" > /dev/null 2>&1; then
+            echo "Erro: O repositório '$ORG_NAME/$REPO_NAME' já existe nesta organização!"
+            exit 1
+          else
+            echo "Nome '$REPO_NAME' está disponível para criação!"
+          fi
+          
+      - name: Create repository
+        id: create-repo
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG_NAME: AgSUS-COGIP
+        run: |
+          REPO_NAME="${{ steps.normalize.outputs.repo_name }}"
+
+          gh repo create "$ORG_NAME/$REPO_NAME" \
+            --${{ github.event.inputs.visibility }} \
+            --description "${{ github.event.inputs.descricao || 'Sem descrição' }}" \
+            --add-readme
+
+      - name: Inject Commit Policies
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG_NAME: AgSUS-COGIP
+          
+          LOCAL_HOOK: |
+            #!/bin/sh
+            COMMIT_MSG_FILE=$1
+            COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
+            CONVENTIONAL_COMMIT_REGEX='^(feat|fix|docs|style|refactor|test|chore|build|ci|perf|revert)(\([a-zA-Z0-9_.-]+\))?(!)?:\s.*$'
+
+            FAILED=0
+            
+            if ! echo "$COMMIT_MSG" | grep -Eq "$CONVENTIONAL_COMMIT_REGEX"; then
+                echo "A mensagem de commit não segue o formato padrão."
+                FAILED=1
+            fi
+            if [ $FAILED -ne 0 ]; then
+              echo
+              echo "O formato correto da mensagem de commit é obrigatório:"
+              echo "  <tipo>(<escopo opcional>): <descrição>"
+              echo
+              echo "Os tipos válidos são:"
+              echo "  feat:     Uma nova funcionalidade."
+              echo "  fix:      Correção de um bug."
+              echo "  docs:     Alterações na documentação."
+              echo "  style:    Alterações de estilo de código (formatação, ponto-e-vírgula ausente, etc.)."
+              echo "  refactor: Refatoração de código (nem corrige bug nem adiciona funcionalidade)."
+              echo "  test:     Adicionar ou atualizar testes."
+              echo "  chore:    Tarefas rotineiras como atualização de dependências ou ferramentas de build."
+              echo "  build:    Alterações que afetam o sistema de build ou dependências externas."
+              echo "  ci:       Alterações nos arquivos de configuração de CI ou scripts."
+              echo "  perf:     Melhorias de desempenho."
+              echo "  revert:   Reverter um commit anterior."
+              echo
+              echo "Exemplos:"
+              echo "  feat(auth): adicionar funcionalidade"
+              echo "  fix: corrigi bug"
+              echo "  docs: atualizar instruções de instalação"
+              echo
+              exit 1
+            fi
+            exit 0
+
+        run: |
+          REPO_NAME="${{ steps.normalize.outputs.repo_name }}"
+          
+          mkdir -p .githooks
+          echo "$LOCAL_HOOK" > .githooks/commit-msg
+
+          CONTENT_LOCAL=$(base64 .githooks/commit-msg | tr -d '\n')
+          gh api -X PUT /repos/$ORG_NAME/$REPO_NAME/contents/.githooks/commit-msg \
+            -f message="chore: add local git hook configuration" -f content="$CONTENT_LOCAL" -f branch="main"
+
+          gh api -X GET /repos/$ORG_NAME/$REPO_NAME/contents/README.md -q '.content' | base64 -d > README.md
+          echo -e "\n\n## 🛠️ Ativação das travas de Commit\nApós clonar o repositório, execute o comando abaixo no seu terminal para ativar a validação automática de commits:\n\`\`\`bash\ngit config core.hooksPath .githooks && chmod +x .githooks/commit-msg\n\`\`\`" >> README.md
+          CONTENT_README=$(base64 README.md | tr -d '\n')
+
+          SHA=$(gh api /repos/$ORG_NAME/$REPO_NAME/contents/README.md -q '.sha')
+          gh api -X PUT /repos/$ORG_NAME/$REPO_NAME/contents/README.md \
+            -f message="docs: update readme with hook instructions" -f content="$CONTENT_README" -f branch="main" -f sha="$SHA"
+
+      - name: Inject Issue Templates
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG_NAME: AgSUS-COGIP
+  
+          BUG_TEMPLATE: |
+            name: "Relato de Bug"
+            description: "Crie um relatório para nos ajudar a identificar e corrigir um problema."
+            title: "[BUG]: <titulo>"
+            labels: ["bug", "triage"]
+            body:
+              - type: textarea
+                id: description
+                attributes:
+                  label: "Descrição"
+                  description: Uma descrição clara e concisa do que é o problema.
+                  placeholder: Descrição breve e explícita do seu incidente...
+                validations:
+                  required: true
+              - type: textarea
+                id: reprod
+                attributes:
+                  label: "Passos de reprodução"
+                  description: Passos para reproduzir o comportamento
+                  value: |
+                    1. Vá para '...'
+                    2. Clique em '....'
+                    3. Role a página até '...'
+                    4. Veja o erro
+                  render: bash
+                validations:
+                  required: true
+              - type: textarea
+                id: screenshot
+                attributes:
+                  label: "Screenshots"
+                  description: Se aplicável, adicione prints de tela ou cole os logs do erro aqui.
+                  value: |
+                    ![DESCRIÇÃO](LINK.png)
+                  render: bash
+                validations:
+                  required: false
+              - type: textarea
+                id: logs
+                attributes:
+                  label: "Logs"
+                  description: Por favor copie e cole qualquer log relevante. O log vai ser automaticamente formatado em código, então não precisa usar crases.
+                  render: bash
+                validations:
+                  required: false
+              - type: dropdown
+                id: navegadores
+                attributes:
+                  label: "Navegadores"
+                  description: Qual navegador você está vendo o problema?
+                  multiple: true
+                  options:
+                    - Firefox
+                    - Chrome
+                    - Safari
+                    - Microsoft Edge
+                    - Opera
+                validations:
+                  required: false
+              - type: dropdown
+                id: os
+                attributes:
+                  label: "Sistema Operacional"
+                  description: Qual é o seu sistema operacional ?
+                  multiple: true
+                  options:
+                    - Windows
+                    - Linux
+                    - Mac
+                validations:
+                  required: false
+  
+          FEATURE_TEMPLATE: |
+            name: "Nova Funcionalidade"
+            description: "Sugira uma ideia ou melhoria para este projeto."
+            title: "[FEATURE]: <titulo>"
+            labels: ["enhancement"]
+            body:
+              - type: textarea
+                id: problem
+                attributes:
+                  label: "Qual problema você está tentando resolver?"
+                  description: Uma descrição clara e concisa de qual é o problema ou necessidade.
+                  placeholder: "Ex: Preciso que o sistema faça tal ação de forma automática pois..."
+                validations:
+                  required: true
+              - type: textarea
+                id: solution
+                attributes:
+                  label: "Solução Desejada"
+                  description: Uma descrição clara e concisa do que você quer que aconteça.
+                  placeholder: "Ex: Eu gostaria que houvesse um botão para exportar o estado do painel..."
+                validations:
+                  required: true
+              - type: textarea
+                id: alternatives
+                attributes:
+                  label: "Alternativas Consideradas"
+                  description: Uma descrição clara e concisa de quaisquer soluções ou recursos alternativos que você considerou.
+                  placeholder: "Ex: Atualmente estamos extraindo os dados via API e montando no Excel, mas o ideal seria..."
+                validations:
+                  required: false
+              - type: textarea
+                id: context
+                attributes:
+                  label: "Contexto Adicional / Prints"
+                  description: Adicione qualquer outro contexto, mockups ou prints sobre a sugestão de recurso aqui.
+                validations:
+                  required: false
+  
+          DOC_TEMPLATE: |
+            name: "Melhoria de Documentação"
+            description: "Proponha correções ou melhorias nos arquivos de ajuda, README ou guias."
+            title: "[DOC]: <titulo>"
+            labels: ["documentation"]
+            body:
+              - type: textarea
+                id: doc_problem
+                attributes:
+                  label: "Onde está o problema na documentação?"
+                  description: Link para o arquivo/página ou descrição de onde a informação está incorreta, desatualizada ou confusa.
+                  placeholder: "Ex: No arquivo README.md, a seção de instalação está com o comando quebrado..."
+                validations:
+                  required: true
+              - type: textarea
+                id: doc_suggestion
+                attributes:
+                  label: "O que deve ser alterado/adicionado?"
+                  description: Descreva a melhoria que você sugere para o texto.
+                  placeholder: "Ex: Substituir o comando 'npm run text' por 'npm run test'..."
+                validations:
+                  required: true
+  
+          SUPPORT_TEMPLATE: |
+            name: "Dúvida ou Suporte"
+            description: "Precisa de ajuda para usar o projeto ou tem alguma dúvida técnica?"
+            title: "[SUPPORT]: <titulo>"
+            labels: ["question"]
+            body:
+              - type: textarea
+                id: question
+                attributes:
+                  label: "Qual é a sua dúvida?"
+                  description: Descreva detalhadamente o que você está tentando fazer e onde encontrou dificuldades.
+                  placeholder: "Ex: Estou tentando integrar o componente X com o banco de dados Y, mas não entendi como..."
+                validations:
+                  required: true
+              - type: textarea
+                id: attempts
+                attributes:
+                  label: "O que você já tentou?"
+                  description: Se aplicável, descreva quais soluções ou abordagens você já testou antes de abrir esta issue.
+                validations:
+                  required: false
+  
+        run: |
+          REPO_NAME="${{ steps.normalize.outputs.repo_name }}"
+          
+          mkdir -p .github/ISSUE_TEMPLATE
+
+          echo "$BUG_TEMPLATE" > .github/ISSUE_TEMPLATE/bug_report.yml
+          CONTENT_BUG=$(base64 .github/ISSUE_TEMPLATE/bug_report.yml | tr -d '\n')
+          gh api -X PUT /repos/$ORG_NAME/$REPO_NAME/contents/.github/ISSUE_TEMPLATE/bug_report.yml \
+            -f message="chore: add bug report issue template" -f content="$CONTENT_BUG" -f branch="main"
+
+          echo "$FEATURE_TEMPLATE" > .github/ISSUE_TEMPLATE/feature_request.yml
+          CONTENT_FEATURE=$(base64 .github/ISSUE_TEMPLATE/feature_request.yml | tr -d '\n')
+          gh api -X PUT /repos/$ORG_NAME/$REPO_NAME/contents/.github/ISSUE_TEMPLATE/feature_request.yml \
+            -f message="chore: add feature request issue template" -f content="$CONTENT_FEATURE" -f branch="main"
+
+          echo "$DOC_TEMPLATE" > .github/ISSUE_TEMPLATE/documentation.yml
+          CONTENT_DOC=$(base64 .github/ISSUE_TEMPLATE/documentation.yml | tr -d '\n')
+          gh api -X PUT /repos/$ORG_NAME/$REPO_NAME/contents/.github/ISSUE_TEMPLATE/documentation.yml \
+            -f message="chore: add documentation issue template" -f content="$CONTENT_DOC" -f branch="main"
+
+          echo "$SUPPORT_TEMPLATE" > .github/ISSUE_TEMPLATE/support.yml
+          CONTENT_SUPPORT=$(base64 .github/ISSUE_TEMPLATE/support.yml | tr -d '\n')
+          gh api -X PUT /repos/$ORG_NAME/$REPO_NAME/contents/.github/ISSUE_TEMPLATE/support.yml \
+            -f message="chore: add support issue template" -f content="$CONTENT_SUPPORT" -f branch="main"
+
+      - name: Inject PR Template
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG_NAME: AgSUS-COGIP
+          
+          PR_TEMPLATE: |
+            ### Descrição Geral
+            > [!NOTE]
+            > _Descreva brevemente o que este Pull Request faz e qual o impacto das alterações no sistema._
+            
+            ---
+            
+            ### Vinculo com Issues
+            | Tipo de Vínculo | Identificador da Issue |
+            | :--- | :--- |
+            | Encerra a Issue | Closes # |
+            | Relacionado com | Fixes # |
+            
+            ---
+            
+            ### Tipo de Alteração
+            _Marque a opção correspondente com um `X` de acordo com o escopo deste código:_
+            - [ ] **Bugfix** _(correção de um problema existente)_
+            - [ ] **Feature** _(nova funcionalidade ou tela)_
+            - [ ] **Refactor** _(reestruturação de código sem alteração de comportamento)_
+            - [ ] **Documentation** _(alteração apenas em arquivos de documentação)_
+            - [ ] **Performance** _(melhoria de desempenho ou otimização)_
+            
+            ---
+            
+            ### Protocolo de Testes
+            _Como essa alteração foi validada antes do envio?_
+            - [ ] **Testes Automatizados:** Foram executados/criados testes unitários ou de integração.
+            - [ ] **Teste Manual:** O fluxo foi testado manualmente em ambiente de desenvolvimento local.
+            
+            ---
+            
+            ### Checklist de Qualidade
+            _Antes de solicitar o Code Review, certifique-se de cumprir os requisitos abaixo:_
+            - [ ] Fiz uma auto-revisão detalhada do meu próprio código buscando redundâncias.
+            - [ ] Não foram deixados `console.log` ou códigos de debug comentados.
+            - [ ] Adicionei documentação ou comentários explicativos em trechos complexos.
+            - [ ] As alterações não geraram novos avisos (*warnings*) críticos no terminal.
+            
+            ---
+            
+            ### Evidências / Screenshots
+            > Se aplicável
+            
+            | Antes da Alteração | Depois da Alteração |
+            | :---: | :---: |
+            | _Insira o print aqui_ | _Insira o print aqui_ |
+
+        run: |
+          REPO_NAME="${{ steps.normalize.outputs.repo_name }}"
+          
+          mkdir -p .github
+          
+          echo "$PR_TEMPLATE" > .github/pull_request_template.md
+          CONTENT_PR=$(base64 .github/pull_request_template.md | tr -d '\n')
+          gh api -X PUT /repos/$ORG_NAME/$REPO_NAME/contents/.github/pull_request_template.md \
+            -f message="chore: add pull request template" -f content="$CONTENT_PR" -f branch="main"
+            
+      - name: Create Ruleset
+        if: ${{ github.event.inputs.visibility == 'public' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG_NAME: AgSUS-COGIP
+        run: |
+          REPO_NAME="${{ steps.normalize.outputs.repo_name }}"
+
+          cat > ruleset.json <<EOF
+          {
+            "name": "Protect Default Branch",
+            "target": "branch",
+            "enforcement": "active",
+            "conditions": {
+              "ref_name": {
+                "include": ["~DEFAULT_BRANCH"],
+                "exclude": []
+              }
+            },
+            "rules": [
+              { "type": "deletion" },
+              { "type": "non_fast_forward" },
+              {
+                "type": "pull_request",
+                "parameters": {
+                  "required_approving_review_count": 1,
+                  "dismiss_stale_reviews_on_push": true,
+                  "require_code_owner_review": false,
+                  "require_last_push_approval": false,
+                  "required_review_thread_resolution": true
+                }
+              },
+              { "type": "required_linear_history" }
+            ],
+            "bypass_actors": []
+          }
+          EOF
+
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/$ORG_NAME/$REPO_NAME/rulesets \
+            --input ruleset.json
+
+      - name: Rollback - Delete repository on failure
+        if: ${{ failure() && steps.create-repo.conclusion == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG_NAME: AgSUS-COGIP
+        run: |
+          REPO_NAME="${{ steps.normalize.outputs.repo_name }}"
+          echo "Erro detectado em uma das etapas essenciais pós-criação."
+          echo "Deletando o repositório '$ORG_NAME/$REPO_NAME' para evitar um estado incompleto/inconsistente..."
+          gh repo delete "$ORG_NAME/$REPO_NAME" --yes
