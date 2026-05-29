@@ -6,7 +6,7 @@
 
 ## Criação de Repositórios e Governança
 
-Para garantir que todos os novos projetos sigam as diretrizes de qualidade da organização, **não criamos repositórios manualmente**. Utilizamos uma esteira automatizada que padroniza a estrutura inicial de qualquer código.
+Para garantir que todos os novos projetos sigam as diretrizes de qualidade da organização, **não criamos repositórios manualmente**. Utilizamos uma esteira automatizada que padroniza a estrutura inicial de qualquer código localizada na aba actions do repositório `.github`.
 
 ### Workflow: `Policy for creation of repository`
 Sempre que precisar iniciar um novo projeto na organização, acesse a aba **Actions** e execute o workflow de criação preenchendo os seguintes campos:
